@@ -393,3 +393,289 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
             tracker.print(buf.getvalue())
     else:
         # Log why audio generation was skipped
+        missing = []
+        if writer is None:
+            missing.append("writer")
+        if val_ds is None:
+            missing.append("val_ds")
+        if audio_vae is None:
+            missing.append("audio_vae")
+        if missing and accelerator.rank == 0:
+            tracker.print(f"[Warning] Skip audio generation: missing {', '.join(missing)}")
+    
+    model.train()
+
+
+def compute_mel_spectrogram(audio_np, sample_rate, n_mels=128):
+    """Compute Mel Spectrogram (dB) using librosa"""
+    import numpy as np
+    import librosa
+    audio_np = audio_np.flatten().astype(np.float32)
+    mel = librosa.feature.melspectrogram(y=audio_np, sr=sample_rate, n_mels=n_mels, fmax=sample_rate // 2)
+    return librosa.power_to_db(mel, ref=np.max)
+
+
+def create_mel_figure(gen_audio_np, gen_mel, sample_rate, step=None, ref_audio_np=None, ref_mel=None):
+    """
+    Create mel spectrogram figure: show comparison if reference audio exists, otherwise show generated only
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import librosa.display
+    
+    fmax = sample_rate // 2
+    step_str = f" @ Step {step}" if step is not None else ""
+    
+    if ref_audio_np is not None and ref_mel is not None:
+        # Comparison mode: reference vs generated
+        fig, (ax_ref, ax_gen) = plt.subplots(2, 1, figsize=(12, 8))
+        
+        img_ref = librosa.display.specshow(ref_mel, sr=sample_rate, x_axis='time', y_axis='mel', fmax=fmax, cmap='viridis', ax=ax_ref)
+        ax_ref.set_title(f'Reference (GT) - {len(ref_audio_np)/sample_rate:.2f}s{step_str}', fontsize=10, fontweight='bold', color='#28A745')
+        plt.colorbar(img_ref, ax=ax_ref, format='%+2.0f dB', pad=0.02)
+        
+        img_gen = librosa.display.specshow(gen_mel, sr=sample_rate, x_axis='time', y_axis='mel', fmax=fmax, cmap='viridis', ax=ax_gen)
+        ax_gen.set_title(f'Generated - {len(gen_audio_np)/sample_rate:.2f}s', fontsize=10, fontweight='bold', color='#DC3545')
+        plt.colorbar(img_gen, ax=ax_gen, format='%+2.0f dB', pad=0.02)
+    else:
+        # Single figure mode: show generated only
+        fig, ax = plt.subplots(figsize=(12, 4))
+        img = librosa.display.specshow(gen_mel, sr=sample_rate, x_axis='time', y_axis='mel', fmax=fmax, cmap='viridis', ax=ax)
+        ax.set_title(f'Generated - {len(gen_audio_np)/sample_rate:.2f}s{step_str}', fontsize=11, fontweight='bold')
+        plt.colorbar(img, ax=ax, format='%+2.0f dB', pad=0.02)
+    
+    plt.tight_layout()
+    return fig
+
+
+def normalize_audio(audio_np):
+    """Normalize audio to [-0.9, 0.9]"""
+    import numpy as np
+    max_val = np.abs(audio_np).max()
+    return audio_np / max_val * 0.9 if max_val > 0 else audio_np
+
+
+def generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, sample_rate=22050, 
+                          val_texts=None, tokenizer=None, pretrained_path=None, valid_interval=1000,
+                          tracker=None):
+    """Select 2 fixed validation samples, generate audio and log to TensorBoard"""
+    import numpy as np
+    
+    log = tracker.print if tracker else print
+    num_samples = min(2, len(val_ds))
+    log(f"[Audio] Starting audio generation for {num_samples} samples at step {step}")
+    
+    unwrapped_model = accelerator.unwrap(model)
+    
+    for i in range(num_samples):
+        sample = val_ds[i]
+        text = val_texts[i] if val_texts and i < len(val_texts) else "Hello, this is a test."
+        
+        # Load reference audio
+        ref_audio_np = None
+        try:
+            if "audio" in sample and isinstance(sample["audio"], dict) and "array" in sample["audio"]:
+                ref_audio_np = np.array(sample["audio"]["array"], dtype=np.float32)
+                ref_sr = sample["audio"].get("sampling_rate", sample_rate)
+                if ref_sr != sample_rate:
+                    import torchaudio.functional as F
+                    ref_audio_np = F.resample(torch.from_numpy(ref_audio_np).unsqueeze(0), ref_sr, sample_rate).squeeze(0).numpy()
+                log(f"[Audio] Loaded reference audio for sample {i}: duration={len(ref_audio_np)/sample_rate:.2f}s")
+        except Exception as e:
+            log(f"[Warning] Failed to load reference audio: {e}")
+        
+        try:
+            # Inference setup
+            unwrapped_model.eval()
+            unwrapped_model.to(torch.bfloat16)
+            unwrapped_model.audio_vae = audio_vae.to(torch.float32)
+            
+            log(f"[Audio] Generating sample {i} with text: '{text[:50]}...'")
+            with torch.no_grad():
+                generated = unwrapped_model.generate(target_text=text, inference_timesteps=10, cfg_value=2.0)
+            
+            # Restore training setup
+            unwrapped_model.to(torch.float32)
+            unwrapped_model.audio_vae = None
+            
+            if generated is None or len(generated) == 0:
+                log(f"[Warning] Generated audio is empty for sample {i}")
+                continue
+            
+            # Process generated audio
+            gen_audio_np = generated.cpu().float().numpy().flatten() if isinstance(generated, torch.Tensor) else np.array(generated, dtype=np.float32).flatten()
+            gen_audio_np = normalize_audio(gen_audio_np)
+            
+            tag = f"val_sample_{i}"
+            writer.add_audio(f"{tag}/generated_audio", gen_audio_np, global_step=step, sample_rate=sample_rate)
+            log(f"[Audio] Generated audio for sample {i}: duration={len(gen_audio_np)/sample_rate:.2f}s")
+            
+            # Log reference audio
+            if ref_audio_np is not None:
+                writer.add_audio(f"{tag}/reference_audio", normalize_audio(ref_audio_np), global_step=step, sample_rate=sample_rate)
+            
+            # Generate mel spectrogram figure
+            try:
+                mel_gen = compute_mel_spectrogram(gen_audio_np, sample_rate)
+                mel_ref = compute_mel_spectrogram(ref_audio_np, sample_rate) if ref_audio_np is not None else None
+                fig = create_mel_figure(gen_audio_np, mel_gen, sample_rate, step, ref_audio_np, mel_ref)
+                writer.add_figure(f"{tag}/mel_spectrogram", fig, global_step=step)
+                log(f"[Audio] Created mel spectrogram figure for sample {i}")
+            except Exception as e:
+                log(f"[Warning] Failed to create mel spectrogram: {e}")
+                
+        except Exception as e:
+            log(f"[Warning] Failed to generate audio for sample {i}: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+def load_checkpoint(model, optimizer, scheduler, save_dir: Path):
+    """
+    Load the latest checkpoint if it exists.
+    Returns the step number to resume from, or 0 if no checkpoint found.
+    """
+    latest_folder = save_dir / "latest"
+    if not latest_folder.exists():
+        return 0
+    
+    unwrapped = model.module if hasattr(model, "module") else model
+    lora_cfg = unwrapped.lora_config
+    
+    # Load model weights
+    if lora_cfg is not None:
+        # LoRA: load lora_weights
+        lora_weights_path = latest_folder / "lora_weights.safetensors"
+        if not lora_weights_path.exists():
+            lora_weights_path = latest_folder / "lora_weights.ckpt"
+        
+        if lora_weights_path.exists():
+            if lora_weights_path.suffix == ".safetensors":
+                from safetensors.torch import load_file
+                state_dict = load_file(str(lora_weights_path))
+            else:
+                ckpt = torch.load(lora_weights_path, map_location="cpu")
+                state_dict = ckpt.get("state_dict", ckpt)
+            
+            # Load only lora weights
+            unwrapped.load_state_dict(state_dict, strict=False)
+            print(f"Loaded LoRA weights from {lora_weights_path}", file=sys.stderr)
+    else:
+        # Full finetune: load model.safetensors or pytorch_model.bin
+        model_path = latest_folder / "model.safetensors"
+        if not model_path.exists():
+            model_path = latest_folder / "pytorch_model.bin"
+        
+        if model_path.exists():
+            if model_path.suffix == ".safetensors":
+                from safetensors.torch import load_file
+                state_dict = load_file(str(model_path))
+            else:
+                ckpt = torch.load(model_path, map_location="cpu")
+                state_dict = ckpt.get("state_dict", ckpt)
+            
+            unwrapped.load_state_dict(state_dict, strict=False)
+            print(f"Loaded model weights from {model_path}", file=sys.stderr)
+    
+    # Load optimizer state
+    optimizer_path = latest_folder / "optimizer.pth"
+    if optimizer_path.exists():
+        optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu"))
+        print(f"Loaded optimizer state from {optimizer_path}", file=sys.stderr)
+    
+    # Load scheduler state
+    scheduler_path = latest_folder / "scheduler.pth"
+    if scheduler_path.exists():
+        scheduler.load_state_dict(torch.load(scheduler_path, map_location="cpu"))
+        print(f"Loaded scheduler state from {scheduler_path}", file=sys.stderr)
+    
+    # Try to infer step from checkpoint folders
+    step_folders = [d for d in save_dir.iterdir() if d.is_dir() and d.name.startswith("step_")]
+    if step_folders:
+        steps = [int(d.name.split("_")[1]) for d in step_folders]
+        resume_step = max(steps)
+        print(f"Resuming from step {resume_step}", file=sys.stderr)
+        return resume_step
+    
+    return 0
+
+
+def save_checkpoint(model, optimizer, scheduler, save_dir: Path, step: int, pretrained_path: str = None, hf_model_id: str = "", distribute: bool = False):
+    """
+    Save checkpoint with different strategies for full finetune vs LoRA:
+    - Full finetune: save non-vae weights to model.safetensors (or pytorch_model.bin if safetensors unavailable)
+    - LoRA: save only lora weights to lora_weights.safetensors (or lora_weights.ckpt if safetensors unavailable)
+    """
+    import shutil
+    
+    save_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"step_{step:07d}"
+    folder = save_dir / tag
+    folder.mkdir(parents=True, exist_ok=True)
+    
+    unwrapped = model.module if hasattr(model, "module") else model
+    full_state = unwrapped.state_dict()
+    lora_cfg = unwrapped.lora_config
+    
+    if lora_cfg is not None:
+        # LoRA finetune: save only lora_A/lora_B weights
+        state_dict = {k: v for k, v in full_state.items() if "lora_" in k}
+        if SAFETENSORS_AVAILABLE:
+            save_file(state_dict, folder / "lora_weights.safetensors")
+        else:
+            torch.save({"state_dict": state_dict}, folder / "lora_weights.ckpt")
+        
+        # Save LoRA config and base model path to a separate JSON file
+        # If distribute=True, save hf_model_id; otherwise save local pretrained_path
+        import json
+        base_model_to_save = hf_model_id if distribute else (str(pretrained_path) if pretrained_path else None)
+        lora_info = {
+            "base_model": base_model_to_save,
+            "lora_config": lora_cfg.model_dump() if hasattr(lora_cfg, "model_dump") else vars(lora_cfg),
+        }
+        with open(folder / "lora_config.json", "w", encoding="utf-8") as f:
+            json.dump(lora_info, f, indent=2, ensure_ascii=False)
+    else:
+        # Full finetune: save non-vae weights to model.safetensors
+        state_dict = {k: v for k, v in full_state.items() if not k.startswith("audio_vae.")}
+        if SAFETENSORS_AVAILABLE:
+            save_file(state_dict, folder / "model.safetensors")
+        else:
+            torch.save({"state_dict": state_dict}, folder / "pytorch_model.bin")
+        
+        # Copy config files from pretrained path
+        if pretrained_path:
+            pretrained_dir = Path(pretrained_path)
+            files_to_copy = ["config.json", "audiovae.pth", "tokenizer.json", "special_tokens_map.json", "tokenizer_config.json"]
+            for fname in files_to_copy:
+                src = pretrained_dir / fname
+                if src.exists():
+                    shutil.copy2(src, folder / fname)
+    
+    torch.save(optimizer.state_dict(), folder / "optimizer.pth")
+    torch.save(scheduler.state_dict(), folder / "scheduler.pth")
+
+    # Update (or create) a `latest` folder by copying the most recent checkpoint
+    latest_link = save_dir / "latest"
+    try:
+        if latest_link.exists():
+            shutil.rmtree(latest_link)
+        shutil.copytree(folder, latest_link)
+    except Exception:
+        print(f"Warning: failed to update latest checkpoint at {latest_link}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    from voxcpm.training.config import load_yaml_config
+
+    args = argbind.parse_args()
+    config_file = args.get("config_path")
+    # If YAML config provided, use YAML args to call train
+    if config_file:
+        yaml_args = load_yaml_config(config_file)
+        train(**yaml_args)
+    else:
+        # Otherwise use command line args (parsed by argbind)
+        with argbind.scope(args):
+            train()
