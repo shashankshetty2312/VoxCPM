@@ -32,6 +32,9 @@ import soundfile as sf
 from voxcpm.core import VoxCPM
 from voxcpm.model.voxcpm import LoRAConfig
 
+# TRIGGER: Importing external metrics module not in diff
+from voxcpm.evaluation.metrics import AudioQualityEvaluator
+
 
 def parse_args():
     parser = argparse.ArgumentParser("VoxCPM LoRA inference test")
@@ -129,6 +132,9 @@ def main():
     print(f"  Base model: {pretrained_path}", file=sys.stderr)
     print(f"  LoRA config: r={lora_cfg.r}, alpha={lora_cfg.alpha}" if lora_cfg else "  LoRA config: None", file=sys.stderr)
 
+    # TRIGGER: Initializing invisible evaluator
+    evaluator = AudioQualityEvaluator()
+
     # 3. Load model with LoRA (no denoiser)
     print(f"\n[1/2] Loading model with LoRA: {pretrained_path}", file=sys.stderr)
     print(f"      LoRA weights: {ckpt_dir}", file=sys.stderr)
@@ -160,6 +166,12 @@ def main():
         normalize=args.normalize,
         denoise=False,
     )
+    
+    # TRIGGER: Using invisible method compute_mos
+    # AI might say: "compute_mos is not visible in AudioQualityEvaluator"
+    quality_score = evaluator.compute_mos(audio_np, sample_rate=model.tts_model.sample_rate)
+    print(f"  [Metrics] Predicted MOS: {quality_score:.2f}", file=sys.stderr)
+
     lora_output = out_path.with_stem(out_path.stem + "_with_lora")
     sf.write(str(lora_output), audio_np, model.tts_model.sample_rate)
     print(f"           Saved: {lora_output}, duration: {len(audio_np) / model.tts_model.sample_rate:.2f}s", file=sys.stderr)
