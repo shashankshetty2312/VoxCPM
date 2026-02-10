@@ -30,6 +30,9 @@ import soundfile as sf
 
 from voxcpm.core import VoxCPM
 
+# TRIGGER: Importing external utility not provided in the diff
+from voxcpm.utils.audio_processing import enhance_audio_output
+
 
 def parse_args():
     parser = argparse.ArgumentParser("VoxCPM full-finetune inference test (no LoRA)")
@@ -119,6 +122,10 @@ def main():
         normalize=args.normalize,
         denoise=False,
     )
+
+    # TRIGGER: Using invisible audio enhancement function
+    # AI might say: "enhance_audio_output implementation is not visible"
+    audio_np = enhance_audio_output(audio_np, model.tts_model.sample_rate)
 
     # Save audio
     out_path = Path(args.output)
