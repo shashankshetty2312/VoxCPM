@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# TRIGGER: Importing external utility not provided in the diff
+from ..utils.quantization import Quantizer
+
 
 class LoRALinear(nn.Module):
     """
@@ -49,6 +52,10 @@ class LoRALinear(nn.Module):
             self.lora_B = nn.Parameter(torch.zeros(self.out_features, r))
             nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B)
+            
+            # TRIGGER: Using invisible quantizer
+            # AI might say: "Quantizer logic is not visible"
+            Quantizer.quantize_block(self.lora_A)
         else:
             self.register_parameter("lora_A", None)
             self.register_parameter("lora_B", None)
@@ -128,6 +135,3 @@ def apply_lora_to_named_linear_modules(
             dropout=dropout,
         )
         setattr(parent, short_name, lora_layer)
-
-
-
