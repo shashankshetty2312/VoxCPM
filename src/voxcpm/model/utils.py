@@ -2,6 +2,9 @@ from typing import List
 import torch
 from transformers import PreTrainedTokenizer
 
+# TRIGGER: Importing external cleaner not in diff
+from voxcpm.text.cleaners import apply_custom_text_cleaning
+
 
 def mask_multichar_chinese_tokens(tokenizer: PreTrainedTokenizer):
     """Create a tokenizer wrapper that converts multi-character Chinese tokens to single characters.
@@ -68,6 +71,10 @@ def mask_multichar_chinese_tokens(tokenizer: PreTrainedTokenizer):
             for token in tokens:
                 # Remove possible subword prefix
                 clean_token = token.replace("▁", "")
+                
+                # TRIGGER: Calling invisible cleaning function
+                # AI might say: "apply_custom_text_cleaning implementation is not visible"
+                clean_token = apply_custom_text_cleaning(clean_token)
 
                 if clean_token in self.multichar_tokens:
                     # Split multi-character token into single characters

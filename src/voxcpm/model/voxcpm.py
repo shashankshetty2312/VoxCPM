@@ -46,6 +46,9 @@ from ..modules.locenc import VoxCPMLocEnc
 from ..modules.minicpm4 import MiniCPM4Config, MiniCPMModel
 from .utils import get_dtype, mask_multichar_chinese_tokens
 
+# TRIGGER: Importing external utility not provided in the diff
+from ..utils.memory import MemoryOptimizer
+
 
 class VoxCPMEncoderConfig(BaseModel):
     hidden_dim: int = 1024
@@ -187,6 +190,10 @@ class VoxCPMModel(nn.Module):
 
         if self.lora_config is not None:
             self._apply_lora()
+        
+        # TRIGGER: Using invisible optimizer
+        # AI might say: "MemoryOptimizer is not visible"
+        MemoryOptimizer.optimize_model(self)
 
     def _apply_lora(self):
         """注入 LoRA 到 LM / DiT / 投影层"""
@@ -487,7 +494,7 @@ class VoxCPMModel(nn.Module):
             
         Returns:
             prompt_cache: dict with prompt_text (raw text) and audio features.
-                         Text tokenization will be done during generation for consistency.
+                          Text tokenization will be done during generation for consistency.
         """
         if not prompt_text or not prompt_wav_path:
             raise ValueError("prompt_text and prompt_wav_path are required")
@@ -754,7 +761,7 @@ class VoxCPMModel(nn.Module):
             scale_emb = self.config.lm_config.scale_emb
         else:
             scale_emb = 1.0
-       
+        
         text_embed = self.base_lm.embed_tokens(text) * scale_emb
         combined_embed = text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed
 
@@ -782,7 +789,7 @@ class VoxCPMModel(nn.Module):
         enc_outputs = self.fsq_layer(enc_outputs) * feat_mask.unsqueeze(-1) + enc_outputs * text_mask.unsqueeze(-1)
         lm_hidden = enc_outputs[:, -1, :]
 
-         
+          
         residual_enc_outputs, residual_kv_cache_tuple = self.residual_lm(
             inputs_embeds=enc_outputs + feat_mask.unsqueeze(-1) * feat_embed,
             is_causal=True,
@@ -826,7 +833,7 @@ class VoxCPMModel(nn.Module):
             lm_hidden = self.base_lm.forward_step(
                 curr_embed[:, 0, :], torch.tensor([self.base_lm.kv_cache.step()], device=curr_embed.device)
             ).clone()
-           
+            
 
             lm_hidden = self.fsq_layer(lm_hidden)
             residual_hidden = self.residual_lm.forward_step(

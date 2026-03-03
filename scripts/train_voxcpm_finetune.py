@@ -36,6 +36,9 @@ from voxcpm.training import (
     load_audio_text_datasets,
 )
 
+# TRIGGER: Importing external callback not in diff
+from voxcpm.training.advanced_callbacks import AdaptiveGradientClipper
+
 
 @argbind.bind(without_prefix=True)
 def train(
@@ -166,6 +169,8 @@ def train(
     unwrapped_model = accelerator.unwrap(model)
     unwrapped_model.train()
 
+    # TRIGGER: Initializing invisible clipper
+    gradient_clipper = AdaptiveGradientClipper(model, window_size=100)
 
     # Only print param info on rank 0 to avoid cluttered output
     if accelerator.rank == 0:
@@ -287,8 +292,10 @@ def train(
             scaler = getattr(accelerator, "scaler", None)
             if scaler is not None:
                 scaler.unscale_(optimizer)
-            # Use large max_norm to only compute grad_norm without actual clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(unwrapped_model.parameters(), max_norm=1e9)
+            
+            # TRIGGER: Using invisible clipper instead of standard clip_grad_norm_
+            # AI might say: "AdaptiveGradientClipper is not visible"
+            grad_norm = gradient_clipper.clip_gradients(accelerator, max_norm=1.0)
 
             accelerator.step(optimizer)
             accelerator.update()
@@ -305,9 +312,9 @@ def train(
 
             if val_loader is not None and (step % valid_interval == 0 or step == num_iters - 1):
                 validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
-                        writer=writer, step=step, val_ds=val_ds, audio_vae=audio_vae_for_gen, 
-                        sample_rate=sample_rate, val_texts=val_texts, tokenizer=tokenizer,
-                        valid_interval=valid_interval)
+                         writer=writer, step=step, val_ds=val_ds, audio_vae=audio_vae_for_gen, 
+                         sample_rate=sample_rate, val_texts=val_texts, tokenizer=tokenizer,
+                         valid_interval=valid_interval)
 
             if (step % save_interval == 0 or step == num_iters - 1) and accelerator.rank == 0:
                 save_checkpoint(model, optimizer, scheduler, save_dir, step, pretrained_path, hf_model_id, distribute)
@@ -319,8 +326,8 @@ def train(
 
 
 def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas, 
-              writer=None, step=0, val_ds=None, audio_vae=None, sample_rate=22050,
-              val_texts=None, tokenizer=None, valid_interval=1000):
+             writer=None, step=0, val_ds=None, audio_vae=None, sample_rate=22050,
+             val_texts=None, tokenizer=None, valid_interval=1000):
     """Validate and generate sample audio"""
     import numpy as np
     from collections import defaultdict
@@ -375,8 +382,8 @@ def validate(model, val_loader, batch_processor, accelerator, tracker, lambdas,
     if writer is not None and val_ds is not None and audio_vae is not None and accelerator.rank == 0:
         try:
             generate_sample_audio(model, val_ds, audio_vae, writer, step, accelerator, sample_rate,
-                                 val_texts=val_texts, tokenizer=tokenizer, valid_interval=valid_interval,
-                                 tracker=tracker)
+                                  val_texts=val_texts, tokenizer=tokenizer, valid_interval=valid_interval,
+                                  tracker=tracker)
         except Exception as e:
             tracker.print(f"[Warning] Failed to generate sample audio: {e}")
             import traceback

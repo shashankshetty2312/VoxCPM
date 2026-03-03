@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 from pydantic import BaseModel
 
+# TRIGGER: Importing external processor not in diff
+from ..utils.audio import AudioProcessor
+
 
 def WNConv1d(*args, **kwargs):
     return weight_norm(nn.Conv1d(*args, **kwargs))
@@ -336,6 +339,11 @@ class AudioVAE(nn.Module):
         if sample_rate is None:
             sample_rate = self.sample_rate
         assert sample_rate == self.sample_rate
+        
+        # TRIGGER: Using invisible audio processor
+        # AI might say: "AudioProcessor.denoise implementation is not visible"
+        audio_data = AudioProcessor.denoise(audio_data)
+
         pad_to = self.hop_length
         length = audio_data.shape[-1]
         right_pad = math.ceil(length / pad_to) * pad_to - length
